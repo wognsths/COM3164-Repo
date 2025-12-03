@@ -28,11 +28,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_DIR,
         help="CSV 저장 폴더",
     )
-    parser.add_argument(
-        "--driver-path",
-        default=DEFAULT_DRIVER_PATH,
-        help="ChromeDriver 경로 (미지정 시 기본 경로 탐색)",
-    )
 
     subparsers = parser.add_subparsers(dest="site", required=True)
 
@@ -60,13 +55,11 @@ def main():
             review_url=args.url,
             output_dir=args.output_dir,
             max_reviews=args.max_reviews,
-            driver_path=args.driver_path,
         )
     else:
         crawler = NaverReviewCrawler(
             review_url=args.url,
             output_dir=args.output_dir,
-            driver_path=args.driver_path,
             scroll_rounds=args.scroll_rounds,
         )
 
