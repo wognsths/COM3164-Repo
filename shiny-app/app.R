@@ -374,6 +374,138 @@ default_multilang_font <- function() {
 }
 
 # -------------------------------------------------------------------
+# Embeddings helpers (UMAP + representativeness)
+# -------------------------------------------------------------------
+load_embeddings <- function() {
+  embed_dir <- file.path(data_dir, "embeddings")
+  nav_rds   <- readRDS(file.path(embed_dir, "naver_embeddings.rds"))
+  imdb_rds  <- readRDS(file.path(embed_dir, "imdb_embeddings.rds"))
+
+  nav_tbl <- naver_reviews %>%
+    select(id, platform, rating, text, date) %>%
+    semi_join(tibble(id = nav_rds$ids), by = "id") %>%
+    mutate(idx = match(id, nav_rds$ids)) %>%
+    arrange(idx)
+
+  imdb_tbl <- imdb_reviews %>%
+    select(id, platform, rating, text, date) %>%
+    semi_join(tibble(id = imdb_rds$ids), by = "id") %>%
+    mutate(idx = match(id, imdb_rds$ids)) %>%
+    arrange(idx)
+
+  nav_mat <- nav_rds$embeddings[nav_tbl$idx, , drop = FALSE]
+  imdb_mat <- imdb_rds$embeddings[imdb_tbl$idx, , drop = FALSE]
+
+  # unit-normalize
+  nav_mat <- nav_mat / sqrt(rowSums(nav_mat * nav_mat))
+  imdb_mat <- imdb_mat / sqrt(rowSums(imdb_mat * imdb_mat))
+
+  list(
+    nav_mat = nav_mat,
+    imdb_mat = imdb_mat,
+    nav_tbl = nav_tbl,
+    imdb_tbl = imdb_tbl
+  )
+}
+
+umap_cache_path <- function(n_neighbors, min_dist) {
+  fname <- sprintf("umap_cache_n%d_d%0.2f.rds", n_neighbors, min_dist)
+  file.path(data_dir, "embeddings", fname)
+}
+
+projection_cache_path <- function(method, n_neighbors = NA, min_dist = NA, perplexity = NA) {
+  suffix <- switch(
+    method,
+    "umap" = sprintf("umap_n%d_d%0.2f", n_neighbors, min_dist),
+    "tsne" = sprintf("tsne_p%0.1f", perplexity),
+    "pca"  = "pca",
+    "proj"
+  )
+  fname <- sprintf("proj_cache_%s.rds", suffix)
+  file.path(data_dir, "embeddings", fname)
+}
+
+compute_projection <- function(
+    nav_mat, imdb_mat,
+    method = c("umap", "tsne", "pca"),
+    seed = 42,
+    n_neighbors = 15,
+    min_dist = 0.1,
+    perplexity = 50
+) {
+  method <- match.arg(method)
+  all_mat <- rbind(nav_mat, imdb_mat)
+
+  cache_file <- projection_cache_path(method, n_neighbors, min_dist, perplexity)
+  if (file.exists(cache_file)) {
+    coords <- readRDS(cache_file)
+    if (is.matrix(coords) && nrow(coords) == nrow(all_mat)) {
+      attr(coords, "source") <- paste0("loaded cache: ", basename(cache_file))
+      return(coords)
+    }
+    warning("Projection cache dimension mismatch; recomputing.")
+    try(unlink(cache_file), silent = TRUE)
+  }
+
+  set.seed(seed)
+  if (method == "umap") {
+    if (!requireNamespace("uwot", quietly = TRUE)) stop("Install 'uwot' for UMAP.")
+    coords <- uwot::umap(
+      all_mat,
+      n_neighbors = n_neighbors,
+      min_dist = min_dist,
+      n_components = 2,
+      verbose = FALSE
+    )
+  } else if (method == "tsne") {
+    if (!requireNamespace("Rtsne", quietly = TRUE)) stop("Install 'Rtsne' for t-SNE.")
+    coords <- Rtsne::Rtsne(
+      all_mat,
+      perplexity = perplexity,
+      dims = 2,
+      theta = 0.5,
+      verbose = FALSE,
+      check_duplicates = FALSE
+    )$Y
+  } else {
+    # PCA fallback (no extra deps)
+    coords <- stats::prcomp(all_mat, rank. = 2)$x
+  }
+
+  attr(coords, "source") <- paste0("computed + cached: ", basename(cache_file))
+  saveRDS(coords, cache_file)
+  coords
+}
+
+build_umap_df <- function(coords, nav_tbl, imdb_tbl) {
+  all_tbl <- bind_rows(nav_tbl, imdb_tbl) %>%
+    mutate(idx = row_number())
+  if (nrow(coords) != nrow(all_tbl)) {
+    stop("UMAP coords rows (", nrow(coords), ") do not match data rows (", nrow(all_tbl), "). Delete cache and retry.")
+  }
+  all_tbl %>%
+    mutate(
+      dim1 = coords[, 1],
+      dim2 = coords[, 2]
+    )
+}
+
+closest_to_centroid <- function(mat, ids, selected_ids, top_n = 10) {
+  if (length(selected_ids) == 0) return(tibble())
+  idx_sel <- match(selected_ids, ids)
+  idx_sel <- idx_sel[!is.na(idx_sel)]
+  if (length(idx_sel) == 0) return(tibble())
+
+  sel_vecs <- mat[idx_sel, , drop = FALSE]
+  centroid <- colMeans(sel_vecs)
+  centroid <- centroid / sqrt(sum(centroid * centroid))
+
+  sims <- as.numeric(mat %*% centroid)
+  top_idx <- order(sims, decreasing = TRUE)[seq_len(min(top_n, length(sims)))]
+  tibble(id = ids[top_idx], sim = sims[top_idx])
+}
+
+# -------------------------------------------------------------------
 # UI
 # -------------------------------------------------------------------
 ui <- navbarPage(
@@ -428,6 +560,34 @@ ui <- navbarPage(
         plotOutput("keyword_dist", height = 340)
       )
     )
+  ),
+  tabPanel(
+    "Embeddings (UMAP)",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("proj_method", "Projection method", choices = c("UMAP" = "umap", "t-SNE" = "tsne", "PCA" = "pca"), selected = "umap"),
+        conditionalPanel(
+          condition = "input.proj_method == 'umap'",
+        sliderInput("umap_neighbors", "UMAP n_neighbors", min = 5, max = 50, value = 15, step = 1),
+        sliderInput("umap_mindist", "UMAP min_dist", min = 0.01, max = 0.8, value = 0.1, step = 0.01),
+        ),
+        conditionalPanel(
+          condition = "input.proj_method == 'tsne'",
+          sliderInput("tsne_perp", "t-SNE perplexity", min = 10, max = 80, value = 50, step = 5)
+        ),
+        sliderInput("umap_topn", "Top representatives", min = 3, max = 30, value = 10, step = 1),
+        helpText("Projections are cached under output/embeddings/proj_cache_*.rds. Hover, brush, and see reps near the centroid.")
+      ),
+      mainPanel(
+        h3("2D projection (color = rating, shape = platform)"),
+        textOutput("umap_status"),
+        plotOutput("umap_plot", height = 420, hover = hoverOpts("umap_hover"), brush = brushOpts("umap_brush")),
+        h3("Selected set summary"),
+        verbatimTextOutput("umap_summary"),
+        h3("Top representative reviews (closest to brush centroid)"),
+        tableOutput("umap_reps")
+      )
+    )
   )
 )
 
@@ -435,6 +595,101 @@ ui <- navbarPage(
 # Server
 # -------------------------------------------------------------------
 server <- function(input, output, session) {
+  # ---------------------------------------------------------------
+  # Embeddings preload + UMAP (compute once, controlled params)
+  # ---------------------------------------------------------------
+  embeds <- load_embeddings()
+  umap_coords <- reactiveVal(NULL)
+  umap_df <- reactiveVal(NULL)
+  umap_status <- reactiveVal("UMAP not computed yet.")
+
+  observeEvent(list(input$proj_method, input$umap_neighbors, input$umap_mindist, input$tsne_perp), {
+    method <- input$proj_method
+    coords <- compute_projection(
+      nav_mat  = embeds$nav_mat,
+      imdb_mat = embeds$imdb_mat,
+      seed = 42,
+      method = method,
+      n_neighbors = input$umap_neighbors,
+      min_dist = input$umap_mindist,
+      perplexity = input$tsne_perp %||% 50
+    )
+    src <- attr(coords, "source", exact = TRUE)
+    umap_status(
+      paste0(
+        "Rows: ", nrow(coords),
+        " | Source: ", ifelse(is.null(src), "computed", src),
+        " | Method=", toupper(method),
+        if (method == "umap") paste0(" | n_neighbors=", input$umap_neighbors, " | min_dist=", input$umap_mindist) else "",
+        if (method == "tsne") paste0(" | perplexity=", input$tsne_perp) else ""
+      )
+    )
+    umap_coords(coords)
+    umap_df(build_umap_df(coords, embeds$nav_tbl, embeds$imdb_tbl))
+  }, ignoreInit = FALSE)
+
+  output$umap_status <- renderText({
+    umap_status()
+  })
+
+  output$umap_plot <- renderPlot({
+    df <- umap_df()
+    req(df)
+    ggplot(df, aes(x = dim1, y = dim2, color = rating, shape = platform)) +
+      geom_point(alpha = 0.6, size = 2) +
+      scale_color_viridis_c(option = "plasma", limits = c(1, 10)) +
+      labs(color = "Rating") +
+      theme_minimal()
+  })
+
+  output$umap_summary <- renderPrint({
+    df <- umap_df()
+    req(df)
+    brush <- input$umap_brush
+    if (is.null(brush)) {
+      cat("Brush to select points on the plot.")
+      return()
+    }
+    sel <- brushedPoints(df, brush, xvar = "dim1", yvar = "dim2")
+    if (nrow(sel) == 0) {
+      cat("No points in selection.")
+      return()
+    }
+    cat("Selected:", nrow(sel), "reviews\n")
+    cat("Platform mix:\n")
+    print(sel %>% count(platform))
+    cat("Rating summary:\n")
+    print(summary(sel$rating))
+  })
+
+  output$umap_reps <- renderTable({
+    df <- umap_df()
+    req(df)
+    brush <- input$umap_brush
+    if (is.null(brush)) return(tibble())
+    sel <- brushedPoints(df, brush, xvar = "dim1", yvar = "dim2")
+    if (nrow(sel) == 0) return(tibble())
+
+    # compute centroid on original embeddings
+    ids_sel <- sel$id
+    all_ids <- c(embeds$nav_tbl$id, embeds$imdb_tbl$id)
+    all_mat <- rbind(embeds$nav_mat, embeds$imdb_mat)
+
+    reps <- closest_to_centroid(
+      mat = all_mat,
+      ids = all_ids,
+      selected_ids = ids_sel,
+      top_n = input$umap_topn
+    )
+    if (nrow(reps) == 0) return(tibble())
+
+    reps %>%
+      left_join(df %>% select(id, platform, rating, text), by = "id") %>%
+      mutate(sim = round(sim, 3),
+             snippet = str_trunc(text, 120)) %>%
+      select(platform, rating, sim, snippet)
+  })
+
   filtered_reviews <- reactive({
     filter_by_date_platform(reviews_all, input$date_range, input$platform) %>%
       filter(!is.na(rating))
